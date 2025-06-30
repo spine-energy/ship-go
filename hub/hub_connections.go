@@ -330,7 +330,7 @@ func (h *Hub) prepareConnectionInitation(ski string, counter int, entry *api.Mdn
 
 	if success := h.initateConnection(service, entry); !success {
 		service.ConnectionStateDetail().SetState(api.ConnectionStateError)
-		go h.checkAutoReannounce()
+		h.checkAutoReannounce()
 	}
 }
 
