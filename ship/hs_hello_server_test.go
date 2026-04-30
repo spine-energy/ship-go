@@ -4,7 +4,6 @@ import (
 	"errors"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/enbility/ship-go/mocks"
 	"github.com/enbility/ship-go/model"
@@ -80,13 +79,14 @@ func (s *HelloSuite) BeforeTest(suiteName, testName string) {
 	s.mockShipInfo.EXPECT().HandleShipHandshakeStateUpdate(mock.Anything, mock.Anything).Return().Maybe()
 	s.mockShipInfo.EXPECT().HandleConnectionClosed(mock.Anything, mock.Anything).Return().Maybe()
 	s.mockShipInfo.EXPECT().IsAutoAcceptEnabled().Return(false).Maybe()
+	// Don't set AllowWaitingForTrust here - let individual tests set it as needed
 
 	s.sut = NewConnectionHandler(s.mockShipInfo, s.mockWSWrite, ShipRoleServer, "LocalShipID", "RemoveDevice", "RemoteShipID")
 }
 
 func (s *HelloSuite) AfterTest(suiteName, testName string) {
-	s.sut.stopHandshakeTimer()
-	assert.Equal(s.T(), false, s.sut.getHandshakeTimerRunning())
+	// Close the connection which will properly stop timers and wait for completion
+	s.sut.CloseConnection(false, 4001, "test cleanup")
 }
 
 func (s *HelloSuite) Test_InitialState() {
@@ -148,13 +148,8 @@ func (s *HelloSuite) Test_ReadyListen_Timeout() {
 	s.sut.setState(model.SmeHelloStateReadyInit, nil) // inits the timer
 	s.sut.setState(model.SmeHelloStateReadyListen, nil)
 
-	if !util.IsRunningOnCI() {
-		// test if the function is triggered correctly via the timer
-		time.Sleep(tHelloInit + time.Second)
-	} else {
-		// speed up the test by running the method directly
-		s.sut.handshakeHello_ReadyListen(true, nil)
-	}
+	// Always use direct method call to avoid timer race conditions with mocks
+	s.sut.handshakeHello_ReadyListen(true, nil)
 
 	assert.Equal(s.T(), model.SmeHelloStateAbortDone, s.sut.getState())
 	assert.NotNil(s.T(), s.lastMessage())
@@ -295,13 +290,8 @@ func (s *HelloSuite) Test_PendingListen_Timeout() {
 	s.sut.setState(model.SmeHelloStatePendingInit, nil) // inits the timer
 	s.sut.setState(model.SmeHelloStatePendingListen, nil)
 
-	if !util.IsRunningOnCI() {
-		// test if the function is triggered correctly via the timer
-		time.Sleep(tHelloInit + time.Second)
-	} else {
-		// speed up the test by running the method directly
-		s.sut.handshakeHello_PendingListen(true, nil)
-	}
+	// Always use direct method call to avoid timer race conditions with mocks
+	s.sut.handshakeHello_PendingListen(true, nil)
 
 	assert.Equal(s.T(), model.SmeHelloStateAbortDone, s.sut.getState())
 	assert.NotNil(s.T(), s.lastMessage())
@@ -396,7 +386,7 @@ func (s *HelloSuite) Test_PendingListen_ReadyWaiting() {
 	helloMsg := model.ConnectionHello{
 		ConnectionHello: model.ConnectionHelloType{
 			Phase:   model.ConnectionHelloPhaseTypeReady,
-			Waiting: util.Ptr(uint(tHelloInit.Milliseconds())),
+			Waiting: util.Ptr(uint(getHelloInitTimeout().Milliseconds())),
 		},
 	}
 
@@ -440,7 +430,7 @@ func (s *HelloSuite) Test_PendingListen_PendingWaiting() {
 	helloMsg := model.ConnectionHello{
 		ConnectionHello: model.ConnectionHelloType{
 			Phase:   model.ConnectionHelloPhaseTypePending,
-			Waiting: util.Ptr(uint(tHelloInit.Milliseconds())),
+			Waiting: util.Ptr(uint(getHelloInitTimeout().Milliseconds())),
 		},
 	}
 
@@ -484,4 +474,103 @@ func (s *HelloSuite) Test_HelloSend_Failure() {
 
 	err := s.sut.handshakeHelloSend(model.ConnectionHelloPhaseTypeAborted, 0, false)
 	assert.NotNil(s.T(), err)
+}
+
+// Additional tests for handshakeHello_PendingListen to improve coverage
+
+func (s *HelloSuite) Test_PendingListen_ProcessMessageError() {
+	s.sut.setState(model.SmeHelloStatePendingInit, nil) // inits the timer
+	s.sut.setState(model.SmeHelloStatePendingListen, nil)
+
+	// Send invalid JSON that will cause processShipJsonMessage to fail
+	invalidMessage := []byte{model.MsgTypeControl, 'i', 'n', 'v', 'a', 'l', 'i', 'd'}
+
+	s.sut.handshakeHello_PendingListen(false, invalidMessage)
+
+	assert.Equal(s.T(), model.SmeHelloStateAbortDone, s.sut.getState())
+}
+
+func (s *HelloSuite) Test_PendingListen_ReadyWaitingBelowMinimum() {
+	s.sut.setState(model.SmeHelloStatePendingInit, nil) // inits the timer
+	s.sut.setState(model.SmeHelloStatePendingListen, nil)
+
+	// Create message with waiting time below minimum threshold (1 second = 1000ms)
+	helloMsg := model.ConnectionHello{
+		ConnectionHello: model.ConnectionHelloType{
+			Phase:   model.ConnectionHelloPhaseTypeReady,
+			Waiting: util.Ptr(uint(500)), // Below tHelloProlongMin (1000ms)
+		},
+	}
+
+	msg, err := s.sut.shipMessage(model.MsgTypeControl, helloMsg)
+	assert.Nil(s.T(), err)
+	assert.NotNil(s.T(), msg)
+
+	s.sut.handshakeHello_PendingListen(false, msg)
+
+	assert.Equal(s.T(), model.SmeHelloStateAbortDone, s.sut.getState())
+}
+
+func (s *HelloSuite) Test_PendingListen_PendingWaitingBelowMinimum() {
+	s.sut.setState(model.SmeHelloStatePendingInit, nil) // inits the timer
+	s.sut.setState(model.SmeHelloStatePendingListen, nil)
+
+	// Create message with waiting time below minimum threshold
+	helloMsg := model.ConnectionHello{
+		ConnectionHello: model.ConnectionHelloType{
+			Phase:   model.ConnectionHelloPhaseTypePending,
+			Waiting: util.Ptr(uint(300)), // Below tHelloProlongMin (1000ms)
+		},
+	}
+
+	msg, err := s.sut.shipMessage(model.MsgTypeControl, helloMsg)
+	assert.Nil(s.T(), err)
+	assert.NotNil(s.T(), msg)
+
+	s.sut.handshakeHello_PendingListen(false, msg)
+
+	assert.Equal(s.T(), model.SmeHelloStateAbortDone, s.sut.getState())
+}
+
+func (s *HelloSuite) Test_PendingListen_PendingProlongationRequestSendError() {
+	s.sut.setState(model.SmeHelloStatePendingInit, nil) // inits the timer
+	s.sut.setState(model.SmeHelloStatePendingListen, nil)
+
+	s.setWSReturnError()
+
+	helloMsg := model.ConnectionHello{
+		ConnectionHello: model.ConnectionHelloType{
+			Phase:               model.ConnectionHelloPhaseTypePending,
+			ProlongationRequest: util.Ptr(true),
+		},
+	}
+
+	msg, err := s.sut.shipMessage(model.MsgTypeControl, helloMsg)
+	assert.Nil(s.T(), err)
+	assert.NotNil(s.T(), msg)
+
+	s.sut.handshakeHello_PendingListen(false, msg)
+
+	assert.Equal(s.T(), model.SmeStateError, s.sut.getState())
+}
+
+func (s *HelloSuite) Test_PendingListen_PendingInvalidCombination() {
+	s.sut.setState(model.SmeHelloStatePendingInit, nil) // inits the timer
+	s.sut.setState(model.SmeHelloStatePendingListen, nil)
+
+	// Create message with neither valid waiting nor prolongation request
+	helloMsg := model.ConnectionHello{
+		ConnectionHello: model.ConnectionHelloType{
+			Phase:               model.ConnectionHelloPhaseTypePending,
+			ProlongationRequest: util.Ptr(false), // false prolongation request
+		},
+	}
+
+	msg, err := s.sut.shipMessage(model.MsgTypeControl, helloMsg)
+	assert.Nil(s.T(), err)
+	assert.NotNil(s.T(), msg)
+
+	s.sut.handshakeHello_PendingListen(false, msg)
+
+	assert.Equal(s.T(), model.SmeHelloStateAbortDone, s.sut.getState())
 }

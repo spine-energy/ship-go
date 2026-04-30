@@ -2,7 +2,6 @@ package ws
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -12,8 +11,6 @@ import (
 	"github.com/enbility/ship-go/model"
 	"github.com/gorilla/websocket"
 )
-
-const connIsClosedError string = "connection is closed"
 
 // Handling of the actual websocket connection to a remote device
 type WebsocketConnection struct {
@@ -36,6 +33,9 @@ type WebsocketConnection struct {
 	connectionClosedError error
 
 	remoteSki string
+
+	// Goroutine lifecycle management
+	pumpsWg sync.WaitGroup
 
 	muxConnClosed sync.Mutex
 	muxShipWrite  sync.Mutex
@@ -80,15 +80,23 @@ func (w *WebsocketConnection) isConnClosed() bool {
 }
 
 func (w *WebsocketConnection) run() {
-	w.shipWriteChannel = make(chan []byte, 1024) // Send outgoing ship messages
-	w.closeChannel = make(chan struct{}, 1)      // Listen to close events
+	w.shipWriteChannel = make(chan []byte, DefaultWriteBufferSize) // Send outgoing ship messages
+	w.closeChannel = make(chan struct{}, 1)                        // Listen to close events
 
+	w.pumpsWg.Add(2)
 	go w.readShipPump()
 	go w.writeShipPump()
 }
 
 // writePump pumps messages from the SPINE and SHIP writeChannels to the websocket connection
 func (w *WebsocketConnection) writeShipPump() {
+	defer w.pumpsWg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			logging.Log().Debug(w.remoteSki, "panic in writeShipPump:", r)
+			w.close()
+		}
+	}()
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
@@ -148,38 +156,39 @@ func (w *WebsocketConnection) closeWithError(err error, reason string) {
 
 // readShipPump checks for messages from the websocket connection
 func (w *WebsocketConnection) readShipPump() {
+	defer w.pumpsWg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			logging.Log().Debug(w.remoteSki, "panic in readShipPump:", r)
+			w.close()
+		}
+	}()
 	_ = w.conn.SetReadDeadline(time.Now().Add(pongWait))
 	w.conn.SetPongHandler(func(string) error { _ = w.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 
 	for {
-		select {
-		case <-w.closeChannel:
+		if w.isConnClosed() {
 			return
-
-		default:
-			if w.isConnClosed() {
-				return
-			}
-
-			message, err := w.readWebsocketMessage()
-			// ignore read errors if the connection got closed
-			if w.isConnClosed() {
-				return
-			}
-
-			if err != nil {
-				logging.Log().Debug(w.remoteSki, "websocket read error: ", err)
-				w.close()
-				w.setConnClosedError(err)
-				w.dataProcessing.ReportConnectionError(err)
-				return
-			}
-
-			text := w.textFromMessage(message)
-			logging.Log().Trace("Recv:", w.remoteSki, text)
-
-			w.dataProcessing.HandleIncomingWebsocketMessage(message)
 		}
+
+		message, err := w.readWebsocketMessage()
+		// ignore read errors if the connection got closed
+		if w.isConnClosed() {
+			return
+		}
+
+		if err != nil {
+			logging.Log().Debug(w.remoteSki, "websocket read error: ", err)
+			w.close()
+			w.setConnClosedError(err)
+			w.dataProcessing.ReportConnectionError(err)
+			return
+		}
+
+		text := w.textFromMessage(message)
+		logging.Log().Trace("Recv:", w.remoteSki, text)
+
+		w.dataProcessing.HandleIncomingWebsocketMessage(message)
 	}
 }
 
@@ -197,7 +206,7 @@ func (w *WebsocketConnection) textFromMessage(msg []byte) string {
 // read a message from the websocket connection
 func (w *WebsocketConnection) readWebsocketMessage() ([]byte, error) {
 	if w.conn == nil {
-		return nil, errors.New("connection is not initialized")
+		return nil, fmt.Errorf("%w for remote SKI %s", api.ErrConnectionNotInitialized, w.remoteSki)
 	}
 
 	msgType, b, err := w.conn.ReadMessage()
@@ -214,11 +223,11 @@ func (w *WebsocketConnection) readWebsocketMessage() ([]byte, error) {
 
 func (w *WebsocketConnection) checkWebsocketMessage(msgType int, data []byte) error {
 	if msgType != websocket.BinaryMessage {
-		return errors.New("message is not a binary message")
+		return fmt.Errorf("websocket message from %s is not binary (type: %d)", w.remoteSki, msgType)
 	}
 
 	if len(data) < 2 {
-		return fmt.Errorf("invalid ship message length")
+		return fmt.Errorf("websocket message from %s too short: %d bytes (minimum 2)", w.remoteSki, len(data))
 	}
 
 	return nil
@@ -233,10 +242,27 @@ func (w *WebsocketConnection) close() {
 
 		w.setConnClosedError(nil)
 
-		close(w.closeChannel)
-
+		// First close the websocket connection to unblock any pending reads
 		if w.conn != nil {
 			_ = w.conn.Close()
+		}
+
+		// Then signal the pumps to stop
+		close(w.closeChannel)
+
+		// Wait for pumps to finish with a timeout
+		done := make(chan struct{})
+		go func() {
+			w.pumpsWg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Pumps exited cleanly
+		case <-time.After(500 * time.Millisecond):
+			// Timeout waiting for pumps
+			logging.Log().Debug(w.remoteSki, "timeout waiting for pump goroutines to exit")
 		}
 	})
 }
@@ -255,14 +281,15 @@ func (w *WebsocketConnection) WriteMessageToWebsocketConnection(message []byte) 
 	defer w.muxShipWrite.Unlock()
 
 	if w.isConnClosed() || w.shipWriteChannel == nil {
-		return errors.New(connIsClosedError)
+		return fmt.Errorf("%w for remote SKI %s", api.ErrConnectionClosed, w.remoteSki)
 	}
 
 	select {
 	case w.shipWriteChannel <- message:
 	default:
 		// too many messages are pending, this doesn't look good
-		return errors.New("could not send message, buffer is full")
+		return fmt.Errorf("%w: websocket message for remote SKI %s (buffer size: %d)", 
+			api.ErrBufferFull, w.remoteSki, DefaultWriteBufferSize)
 	}
 
 	return nil
@@ -288,7 +315,7 @@ func (w *WebsocketConnection) writeMessage(messageType int, data []byte) bool {
 // make sure websocket Write is only called once at a time
 func (w *WebsocketConnection) writeMessageWithoutErrorHandling(messageType int, data []byte) error {
 	if w.isConnClosed() {
-		return errors.New(connIsClosedError)
+		return fmt.Errorf("%w for remote SKI %s", api.ErrConnectionClosed, w.remoteSki)
 	}
 
 	w.muxConWrite.Lock()
@@ -313,7 +340,7 @@ func (w *WebsocketConnection) IsDataConnectionClosed() (bool, error) {
 	err := w.connClosedError()
 
 	if isClosed && err == nil {
-		err = errors.New("connection is closed")
+		err = fmt.Errorf("%w for remote SKI %s", api.ErrConnectionClosed, w.remoteSki)
 	}
 
 	return isClosed, err

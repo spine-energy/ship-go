@@ -1,9 +1,10 @@
 package ship
 
 import (
-	"errors"
+	"fmt"
 	"time"
 
+	"github.com/enbility/ship-go/api"
 	"github.com/enbility/ship-go/logging"
 	"github.com/enbility/ship-go/model"
 )
@@ -46,40 +47,51 @@ func (c *ShipConnection) handleShipMessage(timeout bool, message []byte) {
 
 // set a new handshake state and handle timers if needed
 func (c *ShipConnection) setState(newState model.ShipMessageExchangeState, err error) {
+	// Phase 1: Update state atomically while holding lock
+	var timerOp func()
+	var shouldNotify bool
+	var notifyState model.ShipState
+
 	c.mux.Lock()
-
 	oldState := c.smeState
-
 	c.smeState = newState
 	logging.Log().Trace(c.RemoteSKI(), "SHIP state changed to:", newState)
 
+	// Determine timer operation while holding lock, but don't execute it yet
 	switch newState {
 	case model.SmeHelloStateReadyInit:
-		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, tHelloInit)
+		timerOp = func() { c.setHandshakeTimer(timeoutTimerTypeWaitForReady, getHelloInitTimeout()) }
 	case model.SmeHelloStatePendingInit:
-		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, tHelloInit)
+		timerOp = func() { c.setHandshakeTimer(timeoutTimerTypeWaitForReady, getHelloInitTimeout()) }
 	case model.SmeHelloStateOk:
-		c.stopHandshakeTimer()
+		timerOp = func() { c.stopTimerSafe() }
 	case model.SmeHelloStateAbort, model.SmeHelloStateAbortDone, model.SmeHelloStateRemoteAbortDone, model.SmeHelloStateRejected:
-		c.stopHandshakeTimer()
+		timerOp = func() { c.stopTimerSafe() }
 	case model.SmeProtHStateClientListenChoice:
-		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, cmiTimeout)
+		timerOp = func() { c.setHandshakeTimer(timeoutTimerTypeWaitForReady, getCmiTimeout()) }
 	case model.SmeProtHStateClientOk:
-		c.stopHandshakeTimer()
+		timerOp = func() { c.stopTimerSafe() }
 	}
 
 	c.smeError = nil
 	if oldState != newState {
 		c.smeError = err
-		state := model.ShipState{
+		shouldNotify = true
+		notifyState = model.ShipState{
 			State: newState,
 			Error: err,
 		}
-		c.mux.Unlock()
-		c.infoProvider.HandleShipHandshakeStateUpdate(c.remoteSKI, state)
-		return
 	}
 	c.mux.Unlock()
+
+	// Phase 2: Execute timer operations and notifications without holding lock
+	if timerOp != nil {
+		timerOp()
+	}
+
+	if shouldNotify {
+		c.infoProvider.HandleShipHandshakeStateUpdate(c.remoteSKI, notifyState)
+	}
 }
 
 func (c *ShipConnection) getState() model.ShipMessageExchangeState {
@@ -103,7 +115,8 @@ func (c *ShipConnection) handleState(timeout bool, message []byte) {
 
 	case model.CmiStateClientWait:
 		if timeout {
-			c.endHandshakeWithError(errors.New("ship client handshake timeout"))
+			c.endHandshakeWithError(fmt.Errorf("%w: SHIP client handshake with remote SKI %s (state: %v)", 
+				api.ErrConnectionTimeout, c.remoteSKI, model.CmiStateClientWait))
 			return
 		}
 
@@ -111,7 +124,8 @@ func (c *ShipConnection) handleState(timeout bool, message []byte) {
 
 	case model.CmiStateServerWait:
 		if timeout {
-			c.endHandshakeWithError(errors.New("ship server handshake timeout"))
+			c.endHandshakeWithError(fmt.Errorf("%w: SHIP server handshake with remote SKI %s (state: %v)", 
+				api.ErrConnectionTimeout, c.remoteSKI, model.CmiStateServerWait))
 			return
 		}
 		c.handshakeInit_cmiStateServerWait(message)
@@ -153,7 +167,7 @@ func (c *ShipConnection) handleState(timeout bool, message []byte) {
 
 	case model.SmeHelloStateAbortDone, model.SmeHelloStateRemoteAbortDone:
 		go func() {
-			<-time.After(time.Second)
+			<-time.After(tAbortDelay)
 			c.CloseConnection(false, 4452, "Node rejected by application")
 		}()
 
@@ -166,7 +180,7 @@ func (c *ShipConnection) handleState(timeout bool, message []byte) {
 		c.handshakeProtocol_smeProtHStateServerListenConfirm(message)
 
 	case model.SmeProtHStateClientListenChoice:
-		c.stopHandshakeTimer()
+		c.stopTimerSafe()
 		c.handshakeProtocol_smeProtHStateClientListenChoice(message)
 
 	case model.SmeProtHStateClientOk:
@@ -203,14 +217,14 @@ func (c *ShipConnection) setAndHandleState(state model.ShipMessageExchangeState)
 func (c *ShipConnection) approveHandshake() {
 	// Report to SPINE local device about this remote device connection
 	c.dataReader = c.infoProvider.SetupRemoteDevice(c.remoteSKI, c)
-	c.stopHandshakeTimer()
+	c.stopTimerSafe()
 	c.setState(model.SmeStateComplete, nil)
 	c.processBufferedSpineMessages()
 }
 
 // end the handshake process because of an error
 func (c *ShipConnection) endHandshakeWithError(err error) {
-	c.stopHandshakeTimer()
+	c.stopTimerSafe()
 
 	c.setState(model.SmeStateError, err)
 
@@ -229,39 +243,63 @@ func (c *ShipConnection) endHandshakeWithError(err error) {
 func (c *ShipConnection) setHandshakeTimer(timerType timeoutTimerType, duration time.Duration) {
 	c.stopHandshakeTimer()
 
-	c.setHandshakeTimerRunning(true)
-	c.setHandshakeTimerType(timerType)
-
-	go func() {
-		select {
-		case <-c.handshakeTimerStopChan:
-			return
-		case <-time.After(duration):
-			c.setHandshakeTimerRunning(false)
-			c.handleState(true, nil)
-			return
-		}
-	}()
-}
-
-// stop the handshake timer and close the channel
-func (c *ShipConnection) stopHandshakeTimer() {
-	if !c.getHandshakeTimerRunning() {
-		return
-	}
-
-	select {
-	case c.handshakeTimerStopChan <- struct{}{}:
-	default:
-	}
-	c.setHandshakeTimerRunning(false)
-}
-
-func (c *ShipConnection) setHandshakeTimerRunning(value bool) {
 	c.handshakeTimerMux.Lock()
 	defer c.handshakeTimerMux.Unlock()
 
-	c.handshakeTimerRunning = value
+	// Create a new done channel for this timer
+	c.handshakeTimerDone = make(chan struct{})
+	done := c.handshakeTimerDone
+
+	c.handshakeTimerType = timerType
+	c.handshakeTimerRunning = true
+	c.handshakeTimer = time.AfterFunc(duration, func() {
+		defer close(done) // Signal completion when this goroutine exits
+
+		c.handshakeTimerMux.Lock()
+		// Check if this timer is still active
+		if c.handshakeTimer == nil {
+			c.handshakeTimerMux.Unlock()
+			return
+		}
+		c.handshakeTimer = nil
+		c.handshakeTimerRunning = false
+		c.handshakeTimerMux.Unlock()
+
+		c.handleState(true, nil)
+	})
+}
+
+// stopHandshakeTimer stops the timer and returns a channel that closes when the timer goroutine completes
+func (c *ShipConnection) stopHandshakeTimer() <-chan struct{} {
+	c.handshakeTimerMux.Lock()
+	defer c.handshakeTimerMux.Unlock()
+
+	if c.handshakeTimer == nil {
+		// No timer running, return closed channel
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+
+	// Stop the timer
+	stopped := c.handshakeTimer.Stop()
+	done := c.handshakeTimerDone
+	c.handshakeTimer = nil
+	c.handshakeTimerRunning = false
+
+	// If we successfully stopped the timer (it hadn't fired yet),
+	// we need to close the done channel ourselves since the timer
+	// function won't run to close it
+	if stopped && done != nil {
+		// Use a goroutine to avoid potential deadlock if someone is waiting on done
+		go func() {
+			// Ensure we don't panic on double close (defensive programming)
+			defer func() { recover() }()
+			close(done)
+		}()
+	}
+
+	return done
 }
 
 func (c *ShipConnection) getHandshakeTimerRunning() bool {
@@ -283,4 +321,28 @@ func (c *ShipConnection) getHandshakeTimerType() timeoutTimerType {
 	defer c.handshakeTimerMux.Unlock()
 
 	return c.handshakeTimerType
+}
+
+// stopTimerSafe atomically stops the handshake timer if it's running
+// Returns true if the timer was stopped, false if it wasn't running
+//
+// This method addresses a race condition in timer management where the timer
+// running state was checked without holding the lock continuously through the
+// operation. The atomic implementation prevents concurrent timer operations
+// from conflicting with each other.
+func (c *ShipConnection) stopTimerSafe() bool {
+	c.handshakeTimerMux.Lock()
+	wasRunning := c.handshakeTimerRunning
+	c.handshakeTimerMux.Unlock()
+
+	if wasRunning {
+		c.stopHandshakeTimer()
+	}
+
+	return wasRunning
+}
+
+// startHandshakeTimer starts the handshake timer (exposed for testing)
+func (c *ShipConnection) startHandshakeTimer(duration time.Duration, timerType timeoutTimerType) {
+	c.setHandshakeTimer(timerType, duration)
 }

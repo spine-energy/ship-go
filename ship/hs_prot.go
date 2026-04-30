@@ -2,8 +2,9 @@ package ship
 
 import (
 	"encoding/json"
-	"errors"
+	"fmt"
 
+	"github.com/enbility/ship-go/api"
 	"github.com/enbility/ship-go/logging"
 	"github.com/enbility/ship-go/model"
 )
@@ -46,17 +47,20 @@ func (c *ShipConnection) handshakeProtocol_smeProtHStateServerListenProposal(mes
 	}
 
 	if messageProtocolHandshake.MessageProtocolHandshake.HandshakeType != model.ProtocolHandshakeTypeTypeAnnounceMax {
-		c.endHandshakeWithError(errors.New("Invalid protocol handshake request"))
+		c.endHandshakeWithError(fmt.Errorf("%w from remote SKI %s: expected %s, got %s",
+			api.ErrInvalidHandshake, c.remoteSKI, model.ProtocolHandshakeTypeTypeAnnounceMax, 
+			messageProtocolHandshake.MessageProtocolHandshake.HandshakeType))
 		return
 	}
 
-	c.stopHandshakeTimer()
+	c.stopTimerSafe()
 
 	protocolHandshake := c.protocolHandshake()
 	protocolHandshake.MessageProtocolHandshake.HandshakeType = model.ProtocolHandshakeTypeTypeSelect
 
 	if err := c.sendShipModel(model.MsgTypeControl, protocolHandshake); err != nil {
 		c.endHandshakeWithError(err)
+		return
 	}
 
 	c.setHandshakeTimer(timeoutTimerTypeWaitForReady, cmiTimeout)
@@ -80,7 +84,7 @@ func (c *ShipConnection) handshakeProtocol_smeProtHStateServerListenConfirm(mess
 		return
 	}
 
-	c.stopHandshakeTimer()
+	c.stopTimerSafe()
 
 	c.setAndHandleState(model.SmeProtHStateServerOk)
 }
@@ -147,7 +151,7 @@ func (c *ShipConnection) handshakeProtocol_smeProtHStateClientListenChoice(messa
 		return
 	}
 
-	c.stopHandshakeTimer()
+	c.stopTimerSafe()
 
 	protocolHandshake := c.protocolHandshake()
 	protocolHandshake.MessageProtocolHandshake.HandshakeType = model.ProtocolHandshakeTypeTypeSelect
@@ -161,7 +165,7 @@ func (c *ShipConnection) handshakeProtocol_smeProtHStateClientListenChoice(messa
 }
 
 func (c *ShipConnection) abortProtocolHandshake(err model.MessageProtocolHandshakeErrorErrorType) {
-	c.stopHandshakeTimer()
+	c.stopTimerSafe()
 
 	msg := model.MessageProtocolHandshakeError{
 		Error: err,
@@ -169,7 +173,8 @@ func (c *ShipConnection) abortProtocolHandshake(err model.MessageProtocolHandsha
 
 	_ = c.sendShipModel(model.MsgTypeControl, msg)
 
-	c.setState(model.SmeStateError, errors.New("handshake error"))
+	c.setState(model.SmeStateError, fmt.Errorf("%w with remote SKI %s: %v", 
+		api.ErrInvalidHandshake, c.remoteSKI, err))
 
 	c.CloseConnection(false, 0, "")
 }

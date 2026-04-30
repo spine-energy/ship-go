@@ -66,24 +66,23 @@ func (h *Hub) mapShipMessageExchangeState(state model.ShipMessageExchangeState, 
 
 func (h *Hub) SetAutoAccept(autoaccept bool) {
 	h.muxReg.Lock()
-	defer h.muxReg.Unlock()
-
 	h.autoaccept = autoaccept
+	h.muxReg.Unlock()
 
 	h.mdns.SetAutoAccept(autoaccept)
 }
 
 // check if auto accept is true
 func (h *Hub) IsAutoAcceptEnabled() bool {
-	h.muxReg.Lock()
-	defer h.muxReg.Unlock()
+	h.muxReg.RLock()
+	defer h.muxReg.RUnlock()
 
 	return h.autoaccept
 }
 
 func (h *Hub) checkHasStarted() bool {
-	h.muxStarted.Lock()
-	defer h.muxStarted.Unlock()
+	h.muxStarted.RLock()
+	defer h.muxStarted.RUnlock()
 	return h.hasStarted
 }
 
@@ -123,11 +122,6 @@ func (h *Hub) RegisterRemoteSKI(ski, shipID string) {
 
 		return
 	}
-
-	// locally initiated
-	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
-
-	h.hubReader.ServicePairingDetailUpdate(ski, service.ConnectionStateDetail())
 
 	h.mdns.RequestMdnsEntries()
 }

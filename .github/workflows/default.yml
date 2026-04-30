@@ -23,24 +23,30 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.21
+          go-version: ^1.23
 
       - name: Build
         run: go build -v ./...
 
       - name: Lint
-        uses: golangci/golangci-lint-action@master
+        uses: golangci/golangci-lint-action@v8
         with:
           version: latest
-          skip-pkg-cache: true
-          skip-build-cache: true
-          args: --timeout=3m --issues-exit-code=0 ./...
+          args: --timeout=3m --issues-exit-code=0
 
       - name: Test
         run: go test -race -v -coverprofile=coverage_temp.out  -covermode=atomic ./...
 
-      - name: Remove mocks from coverage
-        run: grep -v "/ship-go/mocks/" coverage_temp.out > coverage.out
+      - name: Deadlock Detection Tests
+        run: go test -race -tags=deadlock -timeout=90s -v ./ship ./hub
+
+      - name: Stress Tests
+        run: go test -race -tags=stress -timeout=180s ./ship ./hub
+
+      - name: Remove test utilities from coverage
+        run: |
+          grep -v -E "/ship-go/(mocks/|internal/testing/|examples/)" coverage_temp.out > coverage.out || true
+          echo "Coverage report filtered to exclude mocks and test utilities"
 
       - name: Send coverage
         uses: coverallsapp/github-action@v2

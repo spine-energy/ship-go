@@ -3,8 +3,10 @@ package hub
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/enbility/ship-go/api"
 	"github.com/enbility/ship-go/logging"
@@ -57,11 +59,23 @@ type Hub struct {
 
 	hasStarted bool
 
-	muxCon        sync.Mutex
-	muxConAttempt sync.Mutex
-	muxReg        sync.Mutex
+	// For tracking server startup errors
+	serverStartErr error
+	serverStarted  chan struct{}
+
+	// connection delay timers that can be cancelled
+	connectionDelayTimers map[string]*connectionDelayTimer
+	muxTimers             sync.RWMutex
+
+	// Maximum number of simultaneous connections allowed
+	// Default is 10 if not configured
+	maxConnections int
+
+	muxCon        sync.RWMutex
+	muxConAttempt sync.RWMutex
+	muxReg        sync.RWMutex
 	muxMdns       sync.Mutex
-	muxStarted    sync.Mutex
+	muxStarted    sync.RWMutex
 }
 
 func NewHub(hubReader api.HubReaderInterface,
@@ -75,11 +89,14 @@ func NewHub(hubReader api.HubReaderInterface,
 		connectionAttemptRunning: make(map[string]bool),
 		remoteServices:           make(map[string]*api.ServiceDetails),
 		knownMdnsEntries:         make([]*api.MdnsEntry, 0),
+		connectionDelayTimers:    make(map[string]*connectionDelayTimer),
 		hubReader:                hubReader,
 		port:                     port,
 		certifciate:              certificate,
 		localService:             localService,
 		mdns:                     mdns,
+		maxConnections:           10, // Default connection limit
+		serverStarted:            make(chan struct{}),
 	}
 
 	return hub
@@ -88,35 +105,119 @@ func NewHub(hubReader api.HubReaderInterface,
 var _ api.HubInterface = (*Hub)(nil)
 
 // Start the ConnectionsHub with all its services
-func (h *Hub) Start() {
+func (h *Hub) Start() error {
 	h.muxStarted.Lock()
-	h.hasStarted = true
-	h.muxStarted.Unlock()
+	defer h.muxStarted.Unlock()
+
+	if h.hasStarted {
+		return fmt.Errorf("%w: call Shutdown() before restarting", api.ErrHubAlreadyStarted)
+	}
+
+	// Reset server state for a fresh start or retry after a previous failure
+	h.serverStarted = make(chan struct{})
+	h.serverStartErr = nil
 
 	// start the websocket server
 	if err := h.startWebsocketServer(); err != nil {
-		logging.Log().Debug("error during websocket server starting:", err)
+		return fmt.Errorf("failed to start hub: %w", err)
+	}
+
+	// Wait briefly to catch immediate startup errors
+	select {
+	case <-h.serverStarted:
+		if h.serverStartErr != nil {
+			return fmt.Errorf("websocket server failed to start: %w", h.serverStartErr)
+		}
+	case <-time.After(100 * time.Millisecond):
+		// Server is likely starting successfully
 	}
 
 	// start mDNS
-	err := h.mdns.Start(h)
-	if err != nil {
-		logging.Log().Debug("error during mdns setup:", err)
+	if err := h.mdns.Start(h); err != nil {
+		// Shutdown the server if mDNS fails
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutdownErr := h.httpServer.Shutdown(ctx); shutdownErr != nil {
+			logging.Log().Error("failed to shutdown HTTP server after mDNS error:", shutdownErr)
+		}
+		return fmt.Errorf("failed to start mDNS: %w", err)
 	}
+
+	h.hasStarted = true
+	return nil
 }
 
 // close all connections
 func (h *Hub) Shutdown() {
+	// First, stop accepting new connections by shutting down the HTTP server
+	if h.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := h.httpServer.Shutdown(ctx); err != nil {
+			logging.Log().Error("HTTP server shutdown error:", err)
+		}
+	}
+
+	// Then shutdown mDNS
 	h.mdns.Shutdown()
-	for _, c := range h.connections {
-		c.CloseConnection(false, 0, "")
+
+	// Cancel all pending connection delay timers
+	h.muxTimers.Lock()
+	for ski, timer := range h.connectionDelayTimers {
+		timer.Stop()
+		delete(h.connectionDelayTimers, ski)
 	}
-	if h.httpServer == nil {
-		return
+	h.muxTimers.Unlock()
+
+	// Close all connections with timeout
+	var wg sync.WaitGroup
+	h.muxCon.RLock()
+	connections := make(map[string]api.ShipConnectionInterface)
+	for ski, c := range h.connections {
+		connections[ski] = c
 	}
-	if err := h.httpServer.Shutdown(context.Background()); err != nil {
-		logging.Log().Error("HTTP server shutdown:", err)
+	h.muxCon.RUnlock()
+
+	for ski, conn := range connections {
+		wg.Add(1)
+		go func(ski string, conn api.ShipConnectionInterface) {
+			defer wg.Done()
+			// Give connections 2 seconds to close gracefully
+			done := make(chan struct{})
+			go func() {
+				conn.CloseConnection(false, 0, "hub shutdown")
+				close(done)
+			}()
+			
+			select {
+			case <-done:
+				logging.Log().Debug("connection closed:", ski)
+			case <-time.After(2 * time.Second):
+				logging.Log().Error("connection failed to close in time:", ski)
+			}
+		}(ski, conn)
 	}
+	
+	// Wait up to 3 seconds for all connections to close
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		logging.Log().Debug("all connections closed successfully")
+	case <-time.After(3 * time.Second):
+		logging.Log().Error("timeout waiting for connections to close")
+	}
+
+	// Reset lifecycle state so the Hub can be restarted
+	h.muxStarted.Lock()
+	h.hasStarted = false
+	h.serverStarted = make(chan struct{})
+	h.serverStartErr = nil
+	h.muxStarted.Unlock()
 }
 
 // return the service for a SKI
@@ -140,23 +241,35 @@ func (h *Hub) ServiceForSKI(ski string) *api.ServiceDetails {
 func (h *Hub) numberPairedServices() int {
 	amount := 0
 
-	h.muxReg.Lock()
+	h.muxReg.RLock()
 	for _, service := range h.remoteServices {
 		if service.Trusted() {
 			amount++
 		}
 	}
-	h.muxReg.Unlock()
+	h.muxReg.RUnlock()
 
 	return amount
+}
+
+// SetMaxConnections sets the maximum number of simultaneous connections allowed
+// A value of 0 or less will use the default of 10
+func (h *Hub) SetMaxConnections(max int) {
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+
+	if max <= 0 {
+		max = 10
+	}
+	h.maxConnections = max
 }
 
 // startup mDNS if a paired service is not connected
 func (h *Hub) checkAutoReannounce() {
 	countPairedServices := h.numberPairedServices()
-	h.muxCon.Lock()
+	h.muxCon.RLock()
 	countConnections := len(h.connections)
-	h.muxCon.Unlock()
+	h.muxCon.RUnlock()
 
 	if countPairedServices > countConnections {
 		_ = h.mdns.AnnounceMdnsEntry()

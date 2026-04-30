@@ -23,17 +23,12 @@ func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, han
 
 	// only remove this connection if it is the registered one for the ski!
 	// as we can have double connections but only one can be registered
-	if existingC := h.connectionForSKI(remoteSki); existingC != nil {
-		if existingC.DataHandler() == connection.DataHandler() {
-			h.muxCon.Lock()
-			delete(h.connections, connection.RemoteSKI())
-			h.muxCon.Unlock()
-		}
+	// Use the new atomic method to avoid race conditions
+	h.UnregisterConnectionIfMatch(remoteSki, connection)
 
-		// connection close was after a completed handshake, so we can reset the attetmpt counter
-		if handshakeCompleted {
-			h.removeConnectionAttemptCounter(connection.RemoteSKI())
-		}
+	// connection close was after a completed handshake, so we can reset the attempt counter
+	if handshakeCompleted {
+		h.removeConnectionAttemptCounter(connection.RemoteSKI())
 	}
 
 	h.hubReader.RemoteSKIDisconnected(connection.RemoteSKI())
@@ -49,8 +44,6 @@ func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, han
 
 // report the ship ID provided during the handshake
 func (h *Hub) ReportServiceShipID(ski string, shipdID string) {
-	h.hubReader.RemoteSKIConnected(ski)
-
 	h.hubReader.ServiceShipIDUpdate(ski, shipdID)
 }
 
@@ -86,6 +79,11 @@ func (h *Hub) HandleShipHandshakeStateUpdate(ski string, state model.ShipState) 
 	existingState := existingDetails.State()
 	if existingState != pairingState || !errors.Is(existingDetails.Error(), state.Error) {
 		service.SetConnectionStateDetail(pairingDetail)
+
+		if pairingState == api.ConnectionStateCompleted {
+			// inform the application about a successful connection
+			h.hubReader.RemoteSKIConnected(ski)
+		}
 
 		// always send a delayed update, as the processing of the new state has to be done
 		// and the SHIP message has to be received by the other service before
