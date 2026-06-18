@@ -931,10 +931,10 @@ func (m *MdnsManager) UnregisterPairingCallback() {
 // detectServiceType determines the service type based on the serviceType parameter
 func (m *MdnsManager) detectServiceType(serviceType string) ServiceType {
 	// Check the serviceType parameter with exact matching
-	switch serviceType {
-	case strings.ToLower(shipPairingZeroConfServiceType): // "_shippairing._tcp"
+	switch strings.ToLower(serviceType) {
+	case shipPairingZeroConfServiceType: // "_shippairing._tcp"
 		return ServiceTypeShipPairing
-	case strings.ToLower(shipZeroConfServiceType): // "_ship._tcp"
+	case shipZeroConfServiceType: // "_ship._tcp"
 		return ServiceTypeShip
 	default:
 		return ServiceTypeUnknown
