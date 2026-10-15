@@ -2092,6 +2092,43 @@ func (s *MdnsSuite) Test_AutoAcceptServiceAlreadyAnnounced() {
 	mdnsProvider.EXPECT().Shutdown()
 }
 
+// addressProviderMock adds announce address support to the provider mock
+type addressProviderMock struct {
+	*mocks.MdnsProviderInterface
+	addresses []net.IP
+}
+
+func (p *addressProviderMock) SetAnnounceAddresses(ips []net.IP) { p.addresses = ips }
+
+func (s *MdnsSuite) Test_SetAnnounceAddresses() {
+	ips := []net.IP{net.ParseIP("192.168.1.209")}
+
+	// not announced yet: only stored
+	assert.Nil(s.T(), s.sut.SetAnnounceAddresses(ips))
+	assert.Equal(s.T(), ips, s.sut.announceAddresses)
+
+	mdnsProvider := mocks.NewMdnsProviderInterface(s.T())
+	provider := &addressProviderMock{MdnsProviderInterface: mdnsProvider}
+	s.sut.mdnsProvider = provider
+	s.sut.isAnnounced = true
+	s.sut.instanceID = "old-id"
+
+	// announced: unannounce, then announce with the addresses
+	mdnsProvider.EXPECT().UnannounceService("old-id").Return(nil).Once()
+	mdnsProvider.EXPECT().AnnounceService(shipZeroConfServiceType, mock.Anything, mock.Anything, mock.Anything).Return("new-id", nil).Once()
+	assert.Nil(s.T(), s.sut.SetAnnounceAddresses(ips))
+	assert.Equal(s.T(), ips, provider.addresses)
+	assert.Equal(s.T(), "new-id", s.sut.instanceID)
+
+	// unannounce fails: no second announcement
+	mdnsProvider.EXPECT().UnannounceService("new-id").Return(errors.New("myError")).Once()
+	assert.NotNil(s.T(), s.sut.SetAnnounceAddresses(nil))
+
+	// AfterTest → Shutdown → UnannounceMdnsEntry tears down the current instance
+	mdnsProvider.EXPECT().UnannounceService("new-id").Return(nil).Once()
+	mdnsProvider.EXPECT().Shutdown()
+}
+
 func (s *MdnsSuite) Test_AutoAcceptMdnsProviderReannounceFails() {
 	mdnsProvider := mocks.NewMdnsProviderInterface(s.T())
 	s.sut.mdnsProvider = mdnsProvider

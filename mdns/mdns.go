@@ -131,6 +131,9 @@ type MdnsManager struct {
 	// Unique instance ID retrieved from the ship service announcement
 	instanceID string
 
+	// Addresses the ship service announcement is restricted to, empty for all host addresses
+	announceAddresses []net.IP
+
 	// Interface refresh state for continuous monitoring
 	currentIfaces   []string            // Currently resolved interface names
 	missingIfaces   map[string]struct{} // Interfaces not resolved
@@ -722,6 +725,15 @@ func (m *MdnsManager) AnnounceMdnsEntry() error {
 
 	logging.Log().Debug("mdns: announce")
 
+	m.mux.Lock()
+	announceAddresses := m.announceAddresses
+	m.mux.Unlock()
+	if setter, ok := m.mdnsProvider.(announceAddressSetter); ok {
+		setter.SetAnnounceAddresses(announceAddresses)
+	} else if len(announceAddresses) > 0 {
+		logging.Log().Debug("mdns: provider does not support announce addresses, announcing all")
+	}
+
 	serviceName := m.serviceName
 
 	instanceID, err := m.mdnsProvider.AnnounceService(shipZeroConfServiceType, serviceName, m.port, txt)
@@ -790,6 +802,38 @@ func (m *MdnsManager) SetAutoAccept(accept bool) {
 	if oldInstanceID != "" && oldInstanceID != m.instanceID {
 		_ = m.mdnsProvider.UnannounceService(oldInstanceID)
 	}
+}
+
+// announceAddressSetter is implemented by providers which can restrict
+// the addresses announced for the ship service
+type announceAddressSetter interface {
+	SetAnnounceAddresses(ips []net.IP)
+}
+
+// SetAnnounceAddresses restricts the addresses announced for the ship service
+// to the given IPs instead of all addresses of the host, e.g. for hosts with
+// multiple addresses of which remotes can only reach some.
+// An empty list restores the default. If the service is already announced,
+// it is announced again.
+//
+// Only supported by the Avahi provider, ignored by others.
+func (m *MdnsManager) SetAnnounceAddresses(ips []net.IP) error {
+	m.mux.Lock()
+	m.announceAddresses = append([]net.IP(nil), ips...)
+	m.mux.Unlock()
+
+	if !m.isServiceAnnounced() || m.mdnsProvider == nil {
+		return nil
+	}
+
+	// Unannounce first: unlike SetAutoAccept's create-then-swap, Avahi
+	// refuses a second service with the same name (Local name collision)
+	m.UnannounceMdnsEntry()
+	if m.isServiceAnnounced() {
+		return fmt.Errorf("mdns: cannot reannounce with new addresses, unannounce failed")
+	}
+
+	return m.AnnounceMdnsEntry()
 }
 
 // SetMdnsProvider sets the mDNS provider for the manager
