@@ -77,6 +77,9 @@ type AvahiProvider struct {
 	// Prevent multiple reconnection goroutines
 	reconnectInProgress bool
 	reconnectMux        sync.Mutex
+
+	// Addresses the ship service is announced with, empty for all host addresses
+	announceAddresses []net.IP
 }
 
 func NewAvahiProvider(ifaceIndexes []int32) *AvahiProvider {
@@ -540,10 +543,26 @@ func (a *AvahiProvider) AnnounceService(serviceType, serviceName string, port in
 		btxt[i] = []byte(t)
 	}
 
+	// Restricted addresses: publish them for a dedicated host name and let the
+	// service point to it, instead of the Avahi host name with all host addresses
+	host := ""
+	if serviceType == shipZeroConfServiceType && len(a.announceAddresses) > 0 {
+		if hostName, err := a.avServer.GetHostName(); err == nil {
+			host = fmt.Sprintf("%s-%d.local", hostName, port)
+		} else {
+			logging.Log().Debug("mdns: avahi - cannot get host name, announcing all addresses:", err)
+		}
+	}
+
 	// Add service to the dedicated EntryGroup
 	// Note: For _shippairing._tcp, we use the same port as the SHIP server since pairing connects to the same WebSocket endpoint
 	for _, iface := range a.getIfaceIndexes() {
-		err := entryGroup.AddService(iface, avahi.ProtoUnspec, 0, serviceName, serviceType, shipZeroConfDomain, "", uint16(port), btxt) // #nosec G115
+		if err := a.addAnnounceAddresses(entryGroup, iface, host); err != nil {
+			a.avServer.EntryGroupFree(entryGroup)
+			delete(a.instanceEntryGroups, instanceID)
+			return "", fmt.Errorf("failed to add %s address: %w", serviceType, err)
+		}
+		err := entryGroup.AddService(iface, avahi.ProtoUnspec, 0, serviceName, serviceType, shipZeroConfDomain, host, uint16(port), btxt) // #nosec G115
 		if err != nil {
 			// Clean up the EntryGroup we just created since AddService failed
 			a.avServer.EntryGroupFree(entryGroup)
@@ -585,6 +604,35 @@ func (a *AvahiProvider) AnnounceService(serviceType, serviceName string, port in
 	}
 
 	return instanceID, nil
+}
+
+// SetAnnounceAddresses restricts the addresses the ship service is announced
+// with, effective with the next announcement. Empty announces all host addresses.
+func (a *AvahiProvider) SetAnnounceAddresses(ips []net.IP) {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	a.announceAddresses = ips
+}
+
+// addAnnounceAddresses adds the announce addresses for the given host name to the entry group.
+// Without reverse entries, as Avahi publishes those for its own host name already.
+func (a *AvahiProvider) addAnnounceAddresses(entryGroup avahi.EntryGroupInterface, iface int32, host string) error {
+	if host == "" {
+		return nil
+	}
+
+	for _, ip := range a.announceAddresses {
+		protocol := int32(avahi.ProtoInet6)
+		if ip.To4() != nil {
+			protocol = avahi.ProtoInet
+		}
+		if err := entryGroup.AddAddress(iface, protocol, avahi.PublishNoReverse, host, ip.String()); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // UnannounceService removes a service instance by its instance ID
