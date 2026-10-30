@@ -298,22 +298,22 @@ func (a *AvahiSuite) Test_Announce_Addresses() {
 	a.avahiMock.EXPECT().GetHostName().Return("myhost", nil).Once()
 	a.entryGroupMock.EXPECT().AddAddress(int32(1), int32(avahi.ProtoInet), uint32(avahi.PublishNoReverse), host, "192.168.1.209").Return(nil).Once()
 	a.entryGroupMock.EXPECT().AddAddress(int32(1), int32(avahi.ProtoInet6), uint32(avahi.PublishNoReverse), host, "fe80::1").Return(nil).Once()
-	a.entryGroupMock.EXPECT().AddService(mock.Anything, mock.Anything, mock.Anything, "dummytest", shipZeroConfServiceType, shipZeroConfDomain, host, mock.Anything, mock.Anything).Return(nil).Once()
+	a.entryGroupMock.EXPECT().AddService(mock.Anything, int32(avahi.ProtoUnspec), mock.Anything, "dummytest", shipZeroConfServiceType, shipZeroConfDomain, host, mock.Anything, mock.Anything).Return(nil).Once()
 	a.entryGroupMock.EXPECT().Commit().Return(nil).Once()
 	_, err := a.sut.AnnounceService(shipZeroConfServiceType, "dummytest", 4289, []string{"more=more"})
 	assert.Nil(a.T(), err)
 
-	// pairing service keeps the Avahi host name
+	// pairing service keeps the Avahi host name on all protocols
 	a.avahiMock.EXPECT().EntryGroupNew().Return(a.entryGroupMock, nil).Once()
-	a.entryGroupMock.EXPECT().AddService(mock.Anything, mock.Anything, mock.Anything, "dummytest", shipPairingZeroConfServiceType, shipZeroConfDomain, "", mock.Anything, mock.Anything).Return(nil).Once()
+	a.entryGroupMock.EXPECT().AddService(mock.Anything, int32(avahi.ProtoUnspec), mock.Anything, "dummytest", shipPairingZeroConfServiceType, shipZeroConfDomain, "", mock.Anything, mock.Anything).Return(nil).Once()
 	a.entryGroupMock.EXPECT().Commit().Return(nil).Once()
 	_, err = a.sut.AnnounceService(shipPairingZeroConfServiceType, "dummytest", 4289, []string{"more=more"})
 	assert.Nil(a.T(), err)
 
-	// without host name, fall back to the Avahi host name
+	// without host name, fall back to the Avahi host name on all protocols
 	a.avahiMock.EXPECT().EntryGroupNew().Return(a.entryGroupMock, nil).Once()
 	a.avahiMock.EXPECT().GetHostName().Return("", errors.New("some error")).Once()
-	a.entryGroupMock.EXPECT().AddService(mock.Anything, mock.Anything, mock.Anything, "dummytest", shipZeroConfServiceType, shipZeroConfDomain, "", mock.Anything, mock.Anything).Return(nil).Once()
+	a.entryGroupMock.EXPECT().AddService(mock.Anything, int32(avahi.ProtoUnspec), mock.Anything, "dummytest", shipZeroConfServiceType, shipZeroConfDomain, "", mock.Anything, mock.Anything).Return(nil).Once()
 	a.entryGroupMock.EXPECT().Commit().Return(nil).Once()
 	_, err = a.sut.AnnounceService(shipZeroConfServiceType, "dummytest", 4289, []string{"more=more"})
 	assert.Nil(a.T(), err)
@@ -325,6 +325,26 @@ func (a *AvahiSuite) Test_Announce_Addresses() {
 	a.avahiMock.EXPECT().EntryGroupFree(a.entryGroupMock).Return().Once()
 	_, err = a.sut.AnnounceService(shipZeroConfServiceType, "dummytest", 4289, []string{"more=more"})
 	assert.NotNil(a.T(), err)
+
+	// only IPv4 addresses: the service is published on IPv4 only, as its host can not be resolved on IPv6
+	a.sut.SetAnnounceAddresses([]net.IP{net.ParseIP("192.168.1.209")})
+	a.avahiMock.EXPECT().EntryGroupNew().Return(a.entryGroupMock, nil).Once()
+	a.avahiMock.EXPECT().GetHostName().Return("myhost", nil).Once()
+	a.entryGroupMock.EXPECT().AddAddress(int32(1), int32(avahi.ProtoInet), uint32(avahi.PublishNoReverse), host, "192.168.1.209").Return(nil).Once()
+	a.entryGroupMock.EXPECT().AddService(mock.Anything, int32(avahi.ProtoInet), mock.Anything, "dummytest", shipZeroConfServiceType, shipZeroConfDomain, host, mock.Anything, mock.Anything).Return(nil).Once()
+	a.entryGroupMock.EXPECT().Commit().Return(nil).Once()
+	_, err = a.sut.AnnounceService(shipZeroConfServiceType, "dummytest", 4289, []string{"more=more"})
+	assert.Nil(a.T(), err)
+
+	// only IPv6 addresses: the service is published on IPv6 only
+	a.sut.SetAnnounceAddresses([]net.IP{net.ParseIP("fe80::1")})
+	a.avahiMock.EXPECT().EntryGroupNew().Return(a.entryGroupMock, nil).Once()
+	a.avahiMock.EXPECT().GetHostName().Return("myhost", nil).Once()
+	a.entryGroupMock.EXPECT().AddAddress(int32(1), int32(avahi.ProtoInet6), uint32(avahi.PublishNoReverse), host, "fe80::1").Return(nil).Once()
+	a.entryGroupMock.EXPECT().AddService(mock.Anything, int32(avahi.ProtoInet6), mock.Anything, "dummytest", shipZeroConfServiceType, shipZeroConfDomain, host, mock.Anything, mock.Anything).Return(nil).Once()
+	a.entryGroupMock.EXPECT().Commit().Return(nil).Once()
+	_, err = a.sut.AnnounceService(shipZeroConfServiceType, "dummytest", 4289, []string{"more=more"})
+	assert.Nil(a.T(), err)
 }
 
 func (a *AvahiSuite) Test_Announce_Pairing() {

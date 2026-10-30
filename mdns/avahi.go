@@ -544,6 +544,8 @@ func (a *AvahiProvider) AnnounceService(serviceType, serviceName string, port in
 		}
 	}
 
+	serviceProtocol := a.announceServiceProtocol(host)
+
 	// Add service to the dedicated EntryGroup
 	// Note: For _shippairing._tcp, we use the same port as the SHIP server since pairing connects to the same WebSocket endpoint
 	for _, iface := range a.ifaceIndexes {
@@ -552,7 +554,7 @@ func (a *AvahiProvider) AnnounceService(serviceType, serviceName string, port in
 			delete(a.instanceEntryGroups, instanceID)
 			return "", fmt.Errorf("failed to add %s address: %w", serviceType, err)
 		}
-		err := entryGroup.AddService(iface, avahi.ProtoUnspec, 0, serviceName, serviceType, shipZeroConfDomain, host, uint16(port), btxt) // #nosec G115
+		err := entryGroup.AddService(iface, serviceProtocol, 0, serviceName, serviceType, shipZeroConfDomain, host, uint16(port), btxt) // #nosec G115
 		if err != nil {
 			// Clean up the EntryGroup we just created since AddService failed
 			a.avServer.EntryGroupFree(entryGroup)
@@ -613,16 +615,39 @@ func (a *AvahiProvider) addAnnounceAddresses(entryGroup avahi.EntryGroupInterfac
 	}
 
 	for _, ip := range a.announceAddresses {
-		protocol := int32(avahi.ProtoInet6)
-		if ip.To4() != nil {
-			protocol = avahi.ProtoInet
-		}
-		if err := entryGroup.AddAddress(iface, protocol, avahi.PublishNoReverse, host, ip.String()); err != nil {
+		if err := entryGroup.AddAddress(iface, ipProtocol(ip), avahi.PublishNoReverse, host, ip.String()); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// announceServiceProtocol returns the protocol to publish the service on.
+// With a dedicated host name, only on the protocol of its addresses: on the
+// other one the host has no address records, so every resolve of the service
+// there runs into the Avahi resolver timeout, once per interface (e.g. veth).
+func (a *AvahiProvider) announceServiceProtocol(host string) int32 {
+	if host == "" || len(a.announceAddresses) == 0 {
+		return avahi.ProtoUnspec
+	}
+
+	protocol := ipProtocol(a.announceAddresses[0])
+	for _, ip := range a.announceAddresses[1:] {
+		if ipProtocol(ip) != protocol {
+			return avahi.ProtoUnspec
+		}
+	}
+
+	return protocol
+}
+
+// ipProtocol returns the Avahi protocol of the given IP
+func ipProtocol(ip net.IP) int32 {
+	if ip.To4() != nil {
+		return avahi.ProtoInet
+	}
+	return avahi.ProtoInet6
 }
 
 // UnannounceService removes a service instance by its instance ID
